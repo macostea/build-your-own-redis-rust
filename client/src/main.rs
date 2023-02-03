@@ -5,10 +5,12 @@ fn main() -> std::io::Result<()> {
 
   let mut s = [0; 64];
 
-  stream.write(&[42])?;
-  stream.read(&mut s)?;
+  let msg = "Hello world";
+  let bytes = (msg.len() as u32).to_be_bytes();
+  s[..4].clone_from_slice(&bytes);
+  s[4..4 + msg.len()].clone_from_slice(msg.as_bytes());
 
-  println!("Read from server: {:?}", s);
+  stream.write(&s)?;
   
   Ok(())
 }
