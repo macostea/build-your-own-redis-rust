@@ -1,57 +1,205 @@
-use std::{net::{TcpListener, TcpStream}, io::{Read, Write}, error::Error};
+use std::{net::{TcpListener}, io, os::fd::{AsRawFd, RawFd}, collections::VecDeque, ptr};
+
+use io_uring::{opcode, types};
+use slab::Slab;
 
 const MAX_MSG_SIZE: usize = 4096;
 const HEADER_SIZE: usize = 4;
 
-fn read_single_message(mut stream: &TcpStream, start: usize) -> Result<Vec<u8>, Box<dyn Error>> {
-    let mut buf = [0; 4 + MAX_MSG_SIZE + 1];
-
-    // Read header
-    let header_size = stream.read(&mut buf[start .. start + HEADER_SIZE])?;
-
-    if header_size != HEADER_SIZE {
-        return Err("Mismatch header size".into());
-    }
-
-    let mut msg_size: [u8; HEADER_SIZE] = [0; HEADER_SIZE];
-    msg_size.clone_from_slice(&buf[start .. start + header_size]);
-    let parsed_msg_size: usize = u32::from_be_bytes(msg_size).try_into()?;
-
-    if parsed_msg_size == 0 {
-        return Err("No more msg".into());
-    }
-
-    let msg_size = stream.read(&mut buf[start + header_size .. start + header_size + parsed_msg_size])?;
-
-    let msg = buf[start + header_size .. start + header_size + msg_size].to_vec();
-
-    Ok(msg)
+#[derive(Clone, Debug)]
+enum MessageState {
+    Header,
+    Message,
 }
 
-fn handle_client(stream: TcpStream) -> Result<(), Box<dyn Error>> {
-    let mut current_msg_start = 0;
-    while let Ok(res) = read_single_message(&stream, current_msg_start) {
-        println!("Read from client {:?}", res);
-        current_msg_start += res.len();
-    }
-
-    Ok(())
+#[derive(Clone, Debug)]
+enum Token {
+    Accept,
+    Read {
+        fd: RawFd,
+        buf_index: usize,
+        state: MessageState,
+    },
+    Poll {
+        fd: RawFd,
+        state: MessageState,
+    },
 }
 
-fn main() -> std::io::Result<()> {
-    let listener = TcpListener::bind("0.0.0.0:8080")?;
+fn main() -> anyhow::Result<()> {
+    let mut ring = io_uring::IoUring::new(256)?;
+    let (submitter, mut sq, mut cq) = ring.split();
+    
+    let listener = TcpListener::bind(("0.0.0.0", 8080))?;
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                if handle_client(stream).is_err() {
-                    println!("Failed to read from client");
+    let mut backlog = VecDeque::new();
+    let mut bufpool = Vec::with_capacity(64);
+    let mut buf_alloc = Slab::with_capacity(64);
+    let mut token_alloc = Slab::with_capacity(64);
+    
+    let token = token_alloc.insert(Token::Accept);
+
+    let accept_op = opcode::Accept::new(types::Fd(listener.as_raw_fd()), ptr::null_mut(), ptr::null_mut()).build().user_data(token as _);
+
+    unsafe {
+        sq.push(&accept_op).expect("submission queue is full");
+        sq.sync();
+    }
+
+    loop {
+        match submitter.submit_and_wait(1) {
+            Ok(_) => (),
+            Err(ref err) if err.raw_os_error() == Some(libc::EBUSY) => (),
+            Err(err) => return Err(err.into()),
+        }
+        cq.sync();
+
+        // clean backlog
+        loop {
+            if sq.is_full() {
+                match submitter.submit() {
+                    Ok(_) => (),
+                    Err(ref err) if err.raw_os_error() == Some(libc::EBUSY) => break,
+                    Err(err) => return Err(err.into()),
                 }
             }
-            Err(e) => {
-                println!("Connection failed {}", e);
+            sq.sync();
+
+            match backlog.pop_front() {
+                Some(sqe) => unsafe {
+                    let _ = sq.push(&sqe);
+                },
+                None => break,
+            }
+        }
+
+        unsafe {
+            sq.push(&accept_op).expect("submission queue is full");
+        }
+
+        for cqe in &mut cq {
+            let res = cqe.result();
+            let token_index = cqe.user_data() as usize;
+
+            if res < 0 {
+                eprintln!(
+                    "token {:?} error: {:?}",
+                    token_alloc.get(token_index),
+                    io::Error::from_raw_os_error(-res)
+                );
+
+                continue;
+            }
+
+            let token = &mut token_alloc[token_index];
+            match token.clone() {
+                Token::Accept => {
+                    println!("Accept");
+                    let socket_fd = res;
+
+                    let poll_token = token_alloc.insert(Token::Poll { fd: socket_fd, state: MessageState::Header });
+
+                    let poll_op = opcode::PollAdd::new(types::Fd(socket_fd), libc::POLLIN as _).build().user_data(poll_token as _);
+
+                    unsafe {
+                        if sq.push(&poll_op).is_err() {
+                            backlog.push_back(poll_op);
+                        }
+                    }
+                }
+
+                Token::Poll { fd, state } => {
+                    println!("Poll");
+                    let (buf_index, buf) = match bufpool.pop() {
+                        Some(buf_index) => (buf_index, &mut buf_alloc[buf_index]),
+                        None => {
+                            let buf = vec![0u8; 4 + MAX_MSG_SIZE + 1].into_boxed_slice();
+                            let buf_entry = buf_alloc.vacant_entry();
+                            let buf_index = buf_entry.key();
+                            (buf_index, buf_entry.insert(buf))
+                        }
+                    };
+
+                    let size_to_read = match state {
+                        MessageState::Header => {
+                            HEADER_SIZE
+                        }
+
+                        MessageState::Message => {
+                            MAX_MSG_SIZE
+                        }
+                    };
+
+                    *token = Token::Read { fd, buf_index, state };
+
+                    let read_op = opcode::Recv::new(types::Fd(fd), buf.as_mut_ptr(), size_to_read as _).build().user_data(token_index as _);
+
+                    unsafe {
+                        if sq.push(&read_op).is_err() {
+                            backlog.push_back(read_op);
+                        }
+                    }
+                }
+
+                Token::Read { fd, buf_index, state } => {
+                    if res == 0 {
+                        bufpool.push(buf_index);
+                        token_alloc.remove(token_index);
+
+                        println!("shutdown");
+
+                        unsafe {
+                            libc::close(fd);
+                        }
+                    } else {
+                        let len = res as usize;
+                        let buf = &mut buf_alloc[buf_index];
+    
+                        match state {
+                            MessageState::Header => {
+                                let mut msg_size: [u8; HEADER_SIZE] = [0; HEADER_SIZE];
+                                msg_size.clone_from_slice(&buf[..len]);
+
+                                let parsed_msg_size: usize = u32::from_be_bytes(msg_size).try_into()?;
+
+                                if parsed_msg_size == 0 {
+                                    bufpool.push(buf_index);
+                                    token_alloc.remove(token_index);
+
+                                    println!("shutdown");
+
+                                    unsafe {
+                                        libc::close(fd);
+                                    }
+                                } else {
+                                    *token = Token::Read { fd, buf_index, state: MessageState::Message };
+
+                                    let read_op = opcode::Recv::new(types::Fd(fd), buf.as_mut_ptr(), parsed_msg_size as _).build().user_data(token_index as _);
+                                    unsafe {
+                                        if sq.push(&read_op).is_err() {
+                                            backlog.push_back(read_op);
+                                        }
+                                    }
+                                }
+                            }
+                            MessageState::Message => {
+                                println!("Received message: {:?}", buf[..len].to_vec());
+                                
+                                bufpool.push(buf_index);
+
+                                *token = Token::Poll { fd, state: MessageState::Header };
+                                let poll_op = opcode::PollAdd::new(types::Fd(fd), libc::POLLIN as _).build().user_data(token_index as _);
+
+                                unsafe {
+                                    if sq.push(&poll_op).is_err() {
+                                        backlog.push_back(poll_op);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
-    Ok(())
 }

@@ -1,4 +1,4 @@
-use std::{net::TcpStream, io::{Write, Read}};
+use std::{net::TcpStream, io::{Write}};
 
 fn main() -> std::io::Result<()> {
   let mut stream = TcpStream::connect("127.0.0.1:8080")?;
