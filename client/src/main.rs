@@ -3,17 +3,21 @@ use std::{io::Write, net::TcpStream};
 fn main() -> std::io::Result<()> {
     let mut stream = TcpStream::connect("127.0.0.1:8080")?;
 
-    let mut s = [0; 64];
+    let mut s = Vec::with_capacity(64);
 
-    let msg = "Hello world";
-    let msg2 = "Ping";
+    let msg = "del";
+    let msg2 = "a";
+    let msg3 = "b";
 
     let bytes = (msg.len() as u32).to_be_bytes();
-    s[..4].clone_from_slice(&bytes);
-    s[4..4 + msg.len()].clone_from_slice(msg.as_bytes());
+    s.append(&mut bytes.into());
+    s.append(&mut msg.into());
 
-    s[4 + msg.len()..4 + msg.len() + 4].clone_from_slice(&(msg2.len() as u32).to_be_bytes());
-    s[4 + msg.len() + 4..4 + msg.len() + 4 + msg2.len()].clone_from_slice(msg2.as_bytes());
+    s.append(&mut (msg2.len() as u32).to_be_bytes().into());
+    s.append(&mut msg2.into());
+
+    // s.append(&mut (msg3.len() as u32).to_be_bytes().into());
+    // s.append(&mut msg2.into());
 
     stream.write(&s)?;
 

@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     io,
     net::TcpListener,
     os::fd::{AsRawFd, RawFd},
@@ -32,6 +32,24 @@ enum Token {
     },
 }
 
+fn run_command(command: &Vec<String>, state: &mut HashMap<String, String>) {
+    match command[0].as_str() {
+        "get" => {
+            let res = state.get(command[1].as_str());
+            println!("Command result: {:?}", res);
+        }
+        "set" => {
+            let res = state.insert(command[1].clone(), command[2].clone());
+            println!("Command result: {:?}", res);
+        }
+        "del" => {
+            let res = state.remove(&command[1].clone());
+            println!("Command result: {:?}", res);
+        }
+        _ => {}
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let mut ring = io_uring::IoUring::new(256)?;
     let (submitter, mut sq, mut cq) = ring.split();
@@ -42,6 +60,9 @@ fn main() -> anyhow::Result<()> {
     let mut bufpool = Vec::with_capacity(64);
     let mut buf_alloc = Slab::with_capacity(64);
     let mut token_alloc = Slab::with_capacity(64);
+    let mut commands = HashMap::<RawFd, Vec<String>>::new();
+
+    let mut storage = HashMap::new();
 
     let token = token_alloc.insert(Token::Accept);
 
@@ -167,6 +188,9 @@ fn main() -> anyhow::Result<()> {
                     state,
                 } => {
                     if res == 0 {
+                        // Execute the command and return the result
+                        run_command(commands.get(&fd).unwrap(), &mut storage);
+
                         bufpool.push(buf_index);
                         token_alloc.remove(token_index);
 
@@ -219,6 +243,18 @@ fn main() -> anyhow::Result<()> {
                             }
                             MessageState::Message => {
                                 println!("Received message: {:?}", buf[..len].to_vec());
+                                let commands_vec = match commands.get_mut(&fd) {
+                                    Some(c) => c,
+                                    None => {
+                                        let v = Vec::new();
+                                        commands.insert(fd, v);
+
+                                        commands.get_mut(&fd).unwrap()
+                                    }
+                                };
+
+                                commands_vec
+                                    .push(std::str::from_utf8(&buf[..len]).unwrap().to_string());
 
                                 bufpool.push(buf_index);
 
