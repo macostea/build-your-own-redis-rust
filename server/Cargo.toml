@@ -5,7 +5,6 @@ edition = "2021"
 
 [dependencies]
 io-uring = "0.5"
-socket2 = "0.4.7"
 libc = "0.2"
 slab = "0.4.8"
 anyhow = "1.0.70"

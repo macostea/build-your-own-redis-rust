@@ -1,4 +1,10 @@
-use std::{net::{TcpListener}, io, os::fd::{AsRawFd, RawFd}, collections::VecDeque, ptr};
+use std::{
+    collections::VecDeque,
+    io,
+    net::TcpListener,
+    os::fd::{AsRawFd, RawFd},
+    ptr,
+};
 
 use io_uring::{opcode, types};
 use slab::Slab;
@@ -29,17 +35,23 @@ enum Token {
 fn main() -> anyhow::Result<()> {
     let mut ring = io_uring::IoUring::new(256)?;
     let (submitter, mut sq, mut cq) = ring.split();
-    
+
     let listener = TcpListener::bind(("0.0.0.0", 8080))?;
 
     let mut backlog = VecDeque::new();
     let mut bufpool = Vec::with_capacity(64);
     let mut buf_alloc = Slab::with_capacity(64);
     let mut token_alloc = Slab::with_capacity(64);
-    
+
     let token = token_alloc.insert(Token::Accept);
 
-    let accept_op = opcode::Accept::new(types::Fd(listener.as_raw_fd()), ptr::null_mut(), ptr::null_mut()).build().user_data(token as _);
+    let accept_op = opcode::Accept::new(
+        types::Fd(listener.as_raw_fd()),
+        ptr::null_mut(),
+        ptr::null_mut(),
+    )
+    .build()
+    .user_data(token as _);
 
     unsafe {
         sq.push(&accept_op).expect("submission queue is full");
@@ -97,9 +109,14 @@ fn main() -> anyhow::Result<()> {
                     println!("Accept");
                     let socket_fd = res;
 
-                    let poll_token = token_alloc.insert(Token::Poll { fd: socket_fd, state: MessageState::Header });
+                    let poll_token = token_alloc.insert(Token::Poll {
+                        fd: socket_fd,
+                        state: MessageState::Header,
+                    });
 
-                    let poll_op = opcode::PollAdd::new(types::Fd(socket_fd), libc::POLLIN as _).build().user_data(poll_token as _);
+                    let poll_op = opcode::PollAdd::new(types::Fd(socket_fd), libc::POLLIN as _)
+                        .build()
+                        .user_data(poll_token as _);
 
                     unsafe {
                         if sq.push(&poll_op).is_err() {
@@ -121,18 +138,21 @@ fn main() -> anyhow::Result<()> {
                     };
 
                     let size_to_read = match state {
-                        MessageState::Header => {
-                            HEADER_SIZE
-                        }
+                        MessageState::Header => HEADER_SIZE,
 
-                        MessageState::Message => {
-                            MAX_MSG_SIZE
-                        }
+                        MessageState::Message => MAX_MSG_SIZE,
                     };
 
-                    *token = Token::Read { fd, buf_index, state };
+                    *token = Token::Read {
+                        fd,
+                        buf_index,
+                        state,
+                    };
 
-                    let read_op = opcode::Recv::new(types::Fd(fd), buf.as_mut_ptr(), size_to_read as _).build().user_data(token_index as _);
+                    let read_op =
+                        opcode::Recv::new(types::Fd(fd), buf.as_mut_ptr(), size_to_read as _)
+                            .build()
+                            .user_data(token_index as _);
 
                     unsafe {
                         if sq.push(&read_op).is_err() {
@@ -141,7 +161,11 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                Token::Read { fd, buf_index, state } => {
+                Token::Read {
+                    fd,
+                    buf_index,
+                    state,
+                } => {
                     if res == 0 {
                         bufpool.push(buf_index);
                         token_alloc.remove(token_index);
@@ -154,13 +178,14 @@ fn main() -> anyhow::Result<()> {
                     } else {
                         let len = res as usize;
                         let buf = &mut buf_alloc[buf_index];
-    
+
                         match state {
                             MessageState::Header => {
                                 let mut msg_size: [u8; HEADER_SIZE] = [0; HEADER_SIZE];
                                 msg_size.clone_from_slice(&buf[..len]);
 
-                                let parsed_msg_size: usize = u32::from_be_bytes(msg_size).try_into()?;
+                                let parsed_msg_size: usize =
+                                    u32::from_be_bytes(msg_size).try_into()?;
 
                                 if parsed_msg_size == 0 {
                                     bufpool.push(buf_index);
@@ -172,9 +197,19 @@ fn main() -> anyhow::Result<()> {
                                         libc::close(fd);
                                     }
                                 } else {
-                                    *token = Token::Read { fd, buf_index, state: MessageState::Message };
+                                    *token = Token::Read {
+                                        fd,
+                                        buf_index,
+                                        state: MessageState::Message,
+                                    };
 
-                                    let read_op = opcode::Recv::new(types::Fd(fd), buf.as_mut_ptr(), parsed_msg_size as _).build().user_data(token_index as _);
+                                    let read_op = opcode::Recv::new(
+                                        types::Fd(fd),
+                                        buf.as_mut_ptr(),
+                                        parsed_msg_size as _,
+                                    )
+                                    .build()
+                                    .user_data(token_index as _);
                                     unsafe {
                                         if sq.push(&read_op).is_err() {
                                             backlog.push_back(read_op);
@@ -184,11 +219,17 @@ fn main() -> anyhow::Result<()> {
                             }
                             MessageState::Message => {
                                 println!("Received message: {:?}", buf[..len].to_vec());
-                                
+
                                 bufpool.push(buf_index);
 
-                                *token = Token::Poll { fd, state: MessageState::Header };
-                                let poll_op = opcode::PollAdd::new(types::Fd(fd), libc::POLLIN as _).build().user_data(token_index as _);
+                                *token = Token::Poll {
+                                    fd,
+                                    state: MessageState::Header,
+                                };
+                                let poll_op =
+                                    opcode::PollAdd::new(types::Fd(fd), libc::POLLIN as _)
+                                        .build()
+                                        .user_data(token_index as _);
 
                                 unsafe {
                                     if sq.push(&poll_op).is_err() {
